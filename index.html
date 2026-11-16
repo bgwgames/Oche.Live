@@ -41,7 +41,7 @@ h2{font-family:var(--display);font-weight:800;font-size:1.5rem;text-transform:up
 .game-opt{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;align-items:center;padding:12px 14px;border-radius:12px;border:1px solid var(--line);text-align:left;background:var(--board)}
 .game-opt .radio{grid-row:span 2;width:18px;height:18px;border-radius:50%;border:2px solid var(--dim)}
 .game-opt b{font-weight:700;font-size:1.02rem}
-.game-opt span{color:var(--dim);font-size:.85rem;grid-column:2}
+.game-opt span:not(.radio){color:var(--dim);font-size:.85rem;grid-column:2}
 .game-opt[aria-pressed="true"]{border-color:var(--sisal);background:var(--raise)}
 .game-opt[aria-pressed="true"] .radio{border-color:var(--sisal);background:radial-gradient(var(--sisal) 45%,transparent 50%)}
 .optrow{display:flex;flex-direction:column;gap:6px}
@@ -317,11 +317,12 @@ async function startGame(){
   const G={cfg:buildCfg(su),turns:[],seen:[],useen:[],host:TAB,hostAt:Date.now(),at:Date.now()};
   resetDraft();
   if(su.share&&syncOK()){
-    S.view='game';S.loadErr='';render();
+    S.role='starting';S.code=null;S.G=null;S.view='game';S.loadErr='';render();
     const code=await freeCode();
-    if(!code){S.view='setup';S.loadErr='Could not reach the game server. Check your signal and try again, or turn off sharing to play on this phone.';render();return}
+    if(S.role!=='starting')return; /* left while the code was being picked */
+    if(!code){S.role=null;S.view='setup';S.loadErr='Could not reach the game server. Check your signal and try again, or turn off sharing to play on this phone.';render();return}
     S.code=code;S.role='host';S.G=G;recompute();
-    ls.set('oche.last',{code,host:true});
+    ls.set('oche.last',{code,host:true,tab:TAB});
     attach(code);hostCommit();
   }else{
     S.code=null;S.role='local';S.G=G;recompute();S.view='game';
@@ -338,13 +339,24 @@ function hostCommit(){
 }
 
 let writing=false,dirty=false;
+/* Errors that retrying cannot fix. The first group also means this phone may not write at all. */
+const NO_ACCESS=new Set(['revoked','not_granted','capability_disabled','capability_removed']);
+const FATAL=new Set([...NO_ACCESS,'invalid_argument','transform_error','quota_exceeded']);
 async function queueWrite(){
-  dirty=true;if(writing)return;writing=true;S.saving=true;let delay=1500;
+  if(NO_ACCESS.has(S.writeErr))return; /* lost write access for this page load: don't retry or re-toast every turn */
+  dirty=true;if(writing)return;writing=true;S.saving=true;let delay=1500,failed=false;
   while(dirty&&S.role==='host'){
-    dirty=false;const body=JSON.parse(JSON.stringify(S.G));
-    try{await S.db.doc('games/'+S.code).set(body);S.writeErr=null;delay=1500}
-    catch(e){S.writeErr=e&&e.code||'unavailable';
-      if(S.writeErr==='invalid_argument'||S.writeErr==='revoked'||S.writeErr==='not_granted'){S.canWrite=false;break}
+    dirty=false;
+    const ref=S.db.doc('games/'+S.code);
+    try{
+      /* After a failed save (e.g. no signal), another phone may have taken over meanwhile.
+         Check before re-sending so a stale copy never overwrites the new host's game. */
+      if(failed){const cur=await ref.get();if(cur.exists&&demoteIfReplaced(cur.data()))break}
+      if(S.role!=='host')break;
+      await ref.set(JSON.parse(JSON.stringify(S.G)));S.writeErr=null;delay=1500;failed=false}
+    catch(e){S.writeErr=e&&e.code||'unavailable';failed=true;
+      if(FATAL.has(S.writeErr)){if(NO_ACCESS.has(S.writeErr))S.canWrite=false;
+        toast('This game can\'t be saved online right now. Scores are kept on this phone.');break}
       dirty=true;render();await sleep(delay+Math.random()*800);delay=Math.min(delay*2,15000)}
   }
   writing=false;S.saving=false;render();
@@ -362,13 +374,15 @@ function attach(code){
     const d=snap.data();
     if(S.role==='host'){
       first=false;
-      if(d.host!==TAB&&(d.hostAt||0)>(S.G.hostAt||0)){S.role='guest';S.G=clone(d);recompute();announceRole();ls.set('oche.last',{code});toast('Another phone took over hosting')}
+      demoteIfReplaced(d);
       render();return;
     }
     const prevLen=S.G?S.G.turns.length:-1;
     S.G=clone(d);recompute();
-    if(first){first=false;const last=ls.get('oche.last');
-      if(last&&last.host&&last.code===code&&S.canWrite!==false&&!snap.metadata.fromCache){
+    /* A returning viewer may get a cached copy first; only the first LIVE snapshot decides whether to resume hosting. */
+    if(first&&!snap.metadata.fromCache){first=false;const last=ls.get('oche.last');
+      /* Resume only if no other phone took over while this one was away (older saves have no tab: allow). */
+      if(last&&last.host&&last.code===code&&S.canWrite!==false&&(!last.tab||d.host===last.tab)){
         const bak=ls.get('oche.bak.'+code);
         if(bak&&bak.turns&&bak.turns.length>S.G.turns.length&&S.G.turns.every((t,i)=>bak.turns[i]&&bak.turns[i].id===t.id))S.G=bak;
         takeOver(true);return}}
@@ -384,11 +398,17 @@ function attach(code){
 }
 function detach(){if(S.sub){try{S.sub()}catch(e){}S.sub=null}if(S.nroom){S.nroom.leave().catch(()=>{});S.nroom=null}S.peers=[];clearTimeout(loadTimer)}
 const clone=o=>JSON.parse(JSON.stringify(o));
+/* If the stored game names a newer host than this phone, step down and adopt its state. */
+function demoteIfReplaced(d){
+  if(S.role!=='host'||!d||d.host===TAB||(d.hostAt||0)<=(S.G.hostAt||0))return false;
+  S.role='guest';S.G=clone(d);recompute();announceRole();ls.set('oche.last',{code:S.code});toast('Another phone took over hosting');
+  return true;
+}
 function announceRole(){if(S.nroom)S.nroom.presence({tab:TAB,role:S.role==='host'?'host':'player'}).catch(()=>{})}
 
 function takeOver(silent){
   if(!S.G)return;S.role='host';S.G.host=TAB;S.G.hostAt=Date.now();
-  ls.set('oche.last',{code:S.code,host:true});announceRole();processPeers(true);hostCommit();
+  ls.set('oche.last',{code:S.code,host:true,tab:TAB});announceRole();processPeers(true);hostCommit();
   if(!silent)toast('This phone is now the host');
 }
 
@@ -548,6 +568,8 @@ function vJoin(){
 const MK=['','<svg class="mk" viewBox="0 0 26 26"><path d="M7 20L19 6"/></svg>','<svg class="mk" viewBox="0 0 26 26"><path d="M7 20L19 6M7 6l12 14"/></svg>','<svg class="mk" viewBox="0 0 26 26"><circle cx="13" cy="13" r="10"/><path d="M7 19L19 7M7 7l12 12"/></svg>'];
 
 function vGame(){
+  if(!S.G&&S.role==='starting'){return`<div class="gbar"><div class="title"><span class="eyebrow">New game</span><b>${esc(GAMES[S.setup.game].name)}</b></div><button class="iconbtn" data-a="leave" aria-label="Cancel">×</button></div>
+    <div class="waiting"><span class="spin"></span>Getting a game code…</div>`}
   if(!S.G){return`<div class="gbar"><div class="title"><span class="eyebrow">Joining</span><b>${esc(S.code||'')}</b></div><button class="iconbtn" data-a="leave" aria-label="Leave">×</button></div>
     <div class="waiting"><span class="spin"></span>${S.loadErr?esc(S.loadErr):'Loading the scoreboard…'}</div>`}
   const st=S.st,cfg=S.G.cfg,g=cfg.game;
@@ -555,7 +577,8 @@ function vGame(){
   const sub=g==='x01'?`${cfg.start} · ${cfg.inRule==='double'?'double in · ':''}${cfg.outRule} out`:g==='cricket'?(cfg.cut?'Cut-throat':'Standard')+(st.rounds?` · round ${Math.min(st.round,st.rounds)} of ${st.rounds}`:` · round ${st.round}`):(g==='shanghai'||g==='countup')?`Round ${Math.min(st.round,st.rounds)} of ${st.rounds}${g==='shanghai'&&!st.over?` · aim for ${st.round}`:''}`:g==='killer'?`${cfg.lives} lives`:'';
   let sync='';
   if(S.role==='local')sync='<span class="status"><span class="dot"></span>This phone</span>';
-  else if(S.role==='host')sync=`<span class="status"><span class="dot ${S.writeErr?'wait':'ok'}"></span>${S.writeErr?'Saving…':'Hosting'}</span>`;
+  else if(S.role==='host')sync=FATAL.has(S.writeErr)?'<span class="status"><span class="dot"></span>Not saving</span>'
+    :`<span class="status"><span class="dot ${S.writeErr?'wait':'ok'}"></span>${S.writeErr?'Saving…':'Hosting'}</span>`;
   else{const hp=hostPresent();sync=`<span class="status"><span class="dot ${hp?'ok':'wait'}"></span>${hp?'Live':'Host offline'}</span>`}
   let h=`<div class="gbar"><div class="title"><span class="eyebrow">${esc(GAMES[g].name)}</span><b>${esc(sub)}</b>${sync}</div>
     <div style="display:flex;gap:8px;align-items:center">${S.code?`<span class="chip" aria-label="Game code">${S.code}</span>`:''}<button class="iconbtn" data-a="menu" aria-label="Game menu">⋯</button></div></div>`;
